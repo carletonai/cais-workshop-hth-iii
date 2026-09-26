@@ -1,105 +1,155 @@
+import argparse
+from copy import deepcopy
+from pathlib import Path
+
+import numpy as np
 import torch
-import numpy
-
-class HeartFailureDataset(torch.utils.data.Dataset):
-
-    def __init__(self, filepath, rows):
-        self.data = numpy.loadtxt(filepath, skiprows=1, delimiter=',')
-        self.data = self.data[rows, :]
-        self.x_data = self.data[:, :-1]
-        
-        x_min = numpy.min(self.x_data, axis=0)
-        x_max = numpy.max(self.x_data, axis=0)
-        
-        self.x_data = (self.x_data - x_min) / (x_max - x_min)
-        self.x_data = torch.tensor(self.x_data, dtype=torch.float32)
-
-        self.y_data = torch.tensor(self.data[:, -1], dtype=torch.long)
-
-    def __len__(self):
-        return self.x_data.shape[0]
-
-    def __getitem__(self, index):
-        x = self.x_data[index, :]
-        y = self.y_data[index]
-
-        return x, y
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 
-class HeartFailureNetwork(torch.nn.Module):
-
-    def __init__(self):
+class HeartFailureNetwork(nn.Module):
+    def __init__(self, input_size):
         super().__init__()
-
-        self.fc1 = torch.nn.Linear(12, 64)
-        self.relu1 = torch.nn.ReLU()
-
-        self.fc2 = torch.nn.Linear(64, 16)
-        self.relu2 = torch.nn.ReLU()
-
-        self.fcout = torch.nn.Linear(16, 2)
+        self.layers = nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 2),
+        )
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu1(x)
-
-        x = self.fc2(x)
-        x = self.relu2(x)
-
-        x = self.fcout(x)
-
-        return x
-
-# Create dataset instances
-dataset_filepath = r"/home/jeremy/cais-workshop-hth-iii/heart_failure_clinical_records_dataset.csv"
-
-train_rows = range(0, 200)
-val_rows = range(200, 250)
-test_rows = range(250, 299)
-
-train_dataset = HeartFailureDataset(dataset_filepath, train_rows)
-val_dataset = HeartFailureDataset(dataset_filepath, val_rows)
-test_dataset = HeartFailureDataset(dataset_filepath, test_rows)
-
-batch_size = 32
-
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=len(val_rows), shuffle=False)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=len(test_rows), shuffle=False)
+        return self.layers(x)
 
 
-heart_failure_network = HeartFailureNetwork()
-print(heart_failure_network)
-criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.SGD(heart_failure_network.parameters(), lr=0.001)
+def load_data(seed):
+    path = Path(__file__).with_name("heart_failure_clinical_records_dataset.csv")
+    data = np.loadtxt(path, skiprows=1, delimiter=",")
+    x = data[:, :11].copy()
+    y = data[:, -1].astype(np.int64)
+    x[:, [2, 6, 7]] = np.log1p(x[:, [2, 6, 7]])
 
-batches_per_epoch = int(len(train_dataset) / batch_size)
+    train_rows, test_rows = train_test_split(
+        np.arange(len(y)), test_size=0.2, stratify=y, random_state=seed
+    )
+    train_rows, val_rows = train_test_split(
+        train_rows, test_size=0.25, stratify=y[train_rows], random_state=seed
+    )
+    scaler = StandardScaler().fit(x[train_rows])
+    datasets = []
+    for rows in (train_rows, val_rows, test_rows):
+        features = torch.tensor(scaler.transform(x[rows]), dtype=torch.float32)
+        labels = torch.tensor(y[rows], dtype=torch.long)
+        datasets.append(TensorDataset(features, labels))
+    return datasets
 
-num_epochs = 10
-for epoch in range(num_epochs):
-    print("Epoch: " + str(epoch))
-    heart_failure_network.train()
-    for batch_x, batch_y in train_loader:
-        batch_y_pred = heart_failure_network(batch_x)
 
-        loss = criterion(batch_y_pred, batch_y)
+def train_model(train, validation, seed, baseline=False):
+    torch.manual_seed(seed)
+    input_size = train.tensors[0].shape[1]
+    if baseline:
+        model = nn.Sequential(
+            nn.Linear(input_size, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, 16), nn.ReLU(),
+            nn.Linear(16, 2),
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+        criterion = nn.CrossEntropyLoss()
+    else:
+        model = HeartFailureNetwork(input_size)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.003, weight_decay=0.01)
+        counts = torch.bincount(train.tensors[1], minlength=2)
+        weights = len(train) / (2 * counts.float())
+        criterion = nn.CrossEntropyLoss(weight=weights)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    loader = DataLoader(
+        train, batch_size=32, shuffle=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
+    best_loss = float("inf")
+    best_state = deepcopy(model.state_dict())
+    best_epoch = 0
+    stale_epochs = 0
+    for epoch in range(1, (50 if baseline else 400) + 1):
+        model.train()
+        for x, y in loader:
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
 
-        # print("Batch loss: " + str(loss))
-    print("Last train batch loss: " + str(loss))
+        model.eval()
+        with torch.no_grad():
+            val_loss = criterion(model(validation.tensors[0]), validation.tensors[1]).item()
+        if val_loss < best_loss - 0.0001:
+            best_loss = val_loss
+            best_state = deepcopy(model.state_dict())
+            best_epoch = epoch
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+        if not baseline and stale_epochs >= 40:
+            break
 
-    heart_failure_network.eval()
-    for batch_x, batch_y in val_loader:
-        batch_y_pred = heart_failure_network(batch_x)    
-        loss = criterion(batch_y_pred, batch_y)
+    if not baseline:
+        model.load_state_dict(best_state)
+    return model, 50 if baseline else best_epoch
 
-        print("Val loss: " + str(loss))
 
-        # print(numpy.argmax(batch_y_pred.detach(), axis=1))
-        # print(batch_y)
-        accuracy = numpy.sum((numpy.argmax(batch_y_pred.detach(), axis=1) == batch_y.detach()).numpy()) / len(batch_y)
+def evaluate(name, labels, predictions):
+    accuracy = accuracy_score(labels, predictions)
+    balanced = balanced_accuracy_score(labels, predictions)
+    recall = recall_score(labels, predictions, zero_division=0)
+    print(f"{name:<22} {accuracy:>9.1%} {balanced:>12.1%} {recall:>12.1%}")
+    return confusion_matrix(labels, predictions, labels=[0, 1])
 
-        print("Val accuracy: " + str(accuracy))
+
+def predict(model, dataset):
+    model.eval()
+    with torch.no_grad():
+        return model(dataset.tensors[0]).argmax(dim=1).numpy()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--compare", action="store_true")
+    args = parser.parse_args()
+    torch.set_num_threads(1)
+    train, validation, test = load_data(args.seed)
+
+    print("Predicting DEATH_EVENT from 11 features; follow-up duration excluded.")
+    for name, dataset in (("Train", train), ("Validation", validation), ("Test", test)):
+        counts = torch.bincount(dataset.tensors[1], minlength=2).tolist()
+        print(f"{name}: {len(dataset)} patients, {counts[0]} survivors, {counts[1]} deaths")
+
+    model, epoch = train_model(train, validation, args.seed)
+    print(f"\nMLP: 11 -> 32 -> 16 -> 2; best validation loss at epoch {epoch}")
+    models = []
+    if args.compare:
+        baseline, _ = train_model(train, validation, args.seed, baseline=True)
+        models.append(("Previous MLP + SGD", baseline))
+    models.append(("Updated MLP + AdamW", model))
+    majority = int(torch.bincount(train.tensors[1]).argmax())
+
+    for name, dataset in (("Validation", validation), ("Test", test)):
+        labels = dataset.tensors[1].numpy()
+        print(f"\n{name} results")
+        print(f"{'Model':<22} {'Accuracy':>9} {'Balanced acc':>12} {'Death recall':>12}")
+        evaluate("Majority baseline", labels, np.full(len(labels), majority))
+        for model_name, candidate in models:
+            matrix = evaluate(model_name, labels, predict(candidate, dataset))
+        print("Updated MLP confusion matrix (rows=actual, columns=predicted; survivor, death):")
+        print(matrix)
+    print("\nComparison uses the same split and preprocessing for both MLPs.")
+    print("The test set is used only for reporting, not training or early stopping.")
+
+
+if __name__ == "__main__":
+    main()
