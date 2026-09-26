@@ -51,7 +51,7 @@ class HeartFailureNetwork(torch.nn.Module):
         return x
 
 # Create dataset instances
-dataset_filepath = r"C:\Users\Matthew\Downloads\heart_failure_clinical_records_dataset.csv"
+dataset_filepath = r"/home/jeremy/cais-workshop-hth-iii/heart_failure_clinical_records_dataset.csv"
 
 train_rows = range(0, 200)
 val_rows = range(200, 250)
